@@ -6,7 +6,8 @@ from mathutils import Vector, Quaternion, Matrix, Euler
 from bpy_extras.io_utils import ImportHelper
 from math import radians, tan
 from .lib.dgkp import *
-
+import cProfile
+import pstats
 
 class DGKP_IMPORTER_OT_IMPORT(bpy.types.Operator, ImportHelper):
     bl_label = "Import DGKP"
@@ -48,10 +49,9 @@ class DGKP_IMPORTER_OT_DROP(bpy.types.Operator):
     def execute(self, context):
 
         start_time = perf_counter()
-        
         addon_prefs = bpy.context.preferences.addons[__package__].preferences
         materials_path = addon_prefs.materials_path
-        
+
         for file in self.files:
             
             self.filepath = os.path.join(self.directory, file.name)
@@ -59,7 +59,7 @@ class DGKP_IMPORTER_OT_DROP(bpy.types.Operator):
         
         elapsed_s = "{:.2f}s".format(perf_counter() - start_time)
         self.report({'INFO'}, "DGKP archives imported in " + elapsed_s)
-
+        
         return {'FINISHED'}
 
 
@@ -208,9 +208,11 @@ def import_dgkp(filePath, materialspath):
     def add_bones(bone, armature, up_matrix):
         bbone = armature.edit_bones.new(bone.name)
         bbone.use_deform = True
-
+        
+        #check the scale sign and adjust the rotation accordingly
         rotation = Quaternion((bone.rotation[3], bone.rotation[0], bone.rotation[1], bone.rotation[2]))
-        transform = Matrix.LocRotScale(bone.position, rotation, bone.scale)
+
+        transform = Matrix.LocRotScale(bone.position, rotation, (1, 1, 1))
 
         # Apply up_matrix to the transform
         final_matrix = up_matrix @ transform
@@ -228,6 +230,7 @@ def import_dgkp(filePath, materialspath):
         # Store debug data
         bbone["orig_matrix"] = transform
         bbone["final_matrix"] = final_matrix
+        bbone["rotation"] = rotation
 
         return bbone
 
@@ -246,7 +249,7 @@ def import_dgkp(filePath, materialspath):
         
         
         for mdl in dgkp.models:
-
+            mdl: MDLD
             armature = bpy.data.armatures.new(mdl.name)
             armature.display_type = 'STICK'
             armature_obj = bpy.data.objects.new(mdl.name, armature)
@@ -255,7 +258,7 @@ def import_dgkp(filePath, materialspath):
             bpy.context.collection.objects.link(armature_obj)
 
             bpy.context.view_layer.objects.active = armature_obj
-            bpy.ops.object.editmode_toggle()
+            bpy.ops.object.mode_set(mode='EDIT')
             
             bones = [add_bones(bone, armature, up_matrix) for bone in mdl.bones]
             
@@ -266,7 +269,6 @@ def import_dgkp(filePath, materialspath):
                 
                 bbone = bones[i]
                 if bone.parent > -1:
-                    parent_bone = mdl.bones[bone.parent]
                     parent_bbone = bones[bone.parent]
                     
                 else:
@@ -274,7 +276,7 @@ def import_dgkp(filePath, materialspath):
                 
                 bbone.parent = parent_bbone
 
-            bpy.ops.object.editmode_toggle()
+            bpy.ops.object.mode_set(mode='OBJECT')
 
 
             meshdata = bpy.data.meshes.new(mdl.skeletonName)
@@ -288,27 +290,32 @@ def import_dgkp(filePath, materialspath):
             for bone in mdl.bones:
                 mesh_obj.vertex_groups.new(name = bone.name)
 
-            custom_normals = []
-
             bm = bmesh.new()
             uv_layer = bm.loops.layers.uv.new(f"UV")
             color_layer = bm.loops.layers.color.new(f"Color")
             vgroup_layer = bm.verts.layers.deform.new("Weights")
 
-            for vertex in mdl.vertices:
-                vert = bm.verts.new(vertex.position)
+            bm_verts = [bm.verts.new((v[0], -v[2], v[1])) for v in mdl.vertices["position"]]
+            
+            if mdl.vertexType & 2:  # has weights
+                boneIDs = mdl.vertices["boneIDs"]
+                weights = mdl.vertices["weights"]
 
-                custom_normals.append(Vector(vertex.normal).normalized())
-                vert[vgroup_layer][vertex.boneIDs[0]] = 0
-                vert[vgroup_layer][vertex.boneIDs[1]] = 0
-                vert[vgroup_layer][vertex.boneIDs[2]] = 0
-                vert[vgroup_layer][vertex.boneIDs[3]] = 0
-                
-                for boneID, weight in zip(vertex.boneIDs, vertex.weights):
-                    vert[vgroup_layer][boneID] += weight
+                # Precompute masks of non-zero weights
+                nonzero_mask = weights > 0
+
+                for i, v in enumerate(bm_verts):
+                    # Select only the non-zero boneIDs and weights for this vertex
+                    valid_ids = boneIDs[i][nonzero_mask[i]]
+                    valid_weights = weights[i][nonzero_mask[i]]
+                    for boneID, weight in zip(valid_ids, valid_weights):
+                        v[vgroup_layer][boneID] = weight
 
             bm.verts.ensure_lookup_table()
 
+            colors = mdl.vertices["color"] / 255.0  # Normalize color values to [0, 1]
+            mdl.vertices["uv"][:, 1] = 1.0 - mdl.vertices["uv"][:, 1]  # In-place Y flip
+            uvs = mdl.vertices["uv"]  # Now uv is the full 2D array
             for i, mat in enumerate(mdl.materialMeshes):
                 mat: MDLD_MaterialMesh
                 material = materialsDGKP.materials.get(mat.name)
@@ -319,19 +326,20 @@ def import_dgkp(filePath, materialspath):
                     face = bm.faces.new((bm.verts[tris[0]], bm.verts[tris[1]], bm.verts[tris[2]]))
                     face.smooth = True
                     face.material_index = i
-                    
-                    face.loops[0][uv_layer].uv = (mdl.vertices[tris[0]].uv[0], 1 - mdl.vertices[tris[0]].uv[1])
-                    face.loops[1][uv_layer].uv = (mdl.vertices[tris[1]].uv[0], 1 - mdl.vertices[tris[1]].uv[1])
-                    face.loops[2][uv_layer].uv = (mdl.vertices[tris[2]].uv[0], 1 - mdl.vertices[tris[2]].uv[1])
-                    
-                    face.loops[0][color_layer] = [x / 255 for x in mdl.vertices[tris[0]].color]
-                    face.loops[1][color_layer] = [x / 255 for x in mdl.vertices[tris[1]].color]
-                    face.loops[2][color_layer] = [x / 255 for x in mdl.vertices[tris[2]].color]
 
+                    face.loops[0][uv_layer].uv = uvs[tris[0]]
+                    face.loops[1][uv_layer].uv = uvs[tris[1]]
+                    face.loops[2][uv_layer].uv = uvs[tris[2]]
+
+                    face.loops[0][color_layer] = colors[tris[0]]
+                    face.loops[1][color_layer] = colors[tris[1]]
+                    face.loops[2][color_layer] = colors[tris[2]]
+            
             bm.to_mesh(meshdata)
-
-            meshdata.normals_split_custom_set_from_vertices(custom_normals)
-            meshdata.transform(up_matrix)
+            bm.free()
+            
+            normals = mdl.vertices["normal"][:, [0, 2, 1]] * [1, -1, 1]  # Swizzle Y and Z
+            meshdata.normals_split_custom_set_from_vertices(normals)
 
             #set active color
             mesh_obj.data.color_attributes.render_color_index = 0
@@ -374,13 +382,23 @@ def import_dgkp(filePath, materialspath):
                         bpy.context.collection.objects.link(child_instance)
 
     def insertFrames(action, group_name, data_path, values, values_count):
-        if len(values):
-            for i in range(values_count):
-                fc = action.fcurves.new(data_path=data_path, index=i, action_group=group_name)
-                fc.keyframe_points.add(len(values.keys()))
-                fc.keyframe_points.foreach_set('co', [x for co in list(map(lambda f, v: (f, v[i]), values.keys(), values.values())) for x in co])
+        if not values:
+            return
 
-                fc.update()
+        frames = np.fromiter(values.keys(), dtype=np.float32, count=len(values))
+        values_np = np.array(list(values.values()), dtype=np.float32)  # shape (N, values_count)
+
+        for i in range(values_count):
+            fc = action.fcurves.new(data_path=data_path, index=i, action_group=group_name)
+            fc.keyframe_points.add(len(frames))
+
+            # Use NumPy to create flattened (frame, value) pairs
+            co = np.empty((len(frames), 2), dtype=np.float32)
+            co[:, 0] = frames
+            co[:, 1] = values_np[:, i]
+
+            fc.keyframe_points.foreach_set('co', co.flatten())
+            fc.update()
 
     for anim in dgkp.animations:
         anim: ANUM
@@ -405,6 +423,16 @@ def import_dgkp(filePath, materialspath):
 
             up_quat = up_matrix.to_quaternion()
             
+            def quat_mul(q1, q2):
+                w1, x1, y1, z1 = q1.T
+                w2, x2, y2, z2 = q2.T
+                return np.array([
+                    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                    w1*z2 + x1*y2 - y1*x2 + z1*w2,
+                ]).T  # Shape: (N, 4)
+            
             for curve in sklAnim.curves:
                 curve: TOMF_Curve
                 group_name = action.groups.new(name = bones[curve.index]).name
@@ -417,27 +445,27 @@ def import_dgkp(filePath, materialspath):
                     matrix = Matrix(bbone["orig_matrix"])
 
                 loc, rot, scale = matrix.decompose()
+                rot = np.array((rot[0], -rot[1], -rot[2], -rot[3]), dtype=np.float32)
+
+                # Location
+                if len(curve.locationFrames):
+                    f = curve.locationFrames['frame']
+                    v = curve.locationFrames['pos'] - loc
+                    insertFrames(action, group_name, f'{bone_path}.location', dict(zip(f, v)), 3)
+
+                # Rotation
+                if len(curve.rotationFrames):
+                    f = curve.rotationFrames['frame']
+                    q = curve.rotationFrames['quat'][:, [3, 0, 1, 2]]  # to wxyz
+                    r = quat_mul(rot, q)
+                    insertFrames(action, group_name, f'{bone_path}.rotation_quaternion', dict(zip(f, r)), 4)
+
+                # Scale
+                if len(curve.scaleFrames):
+                    f = curve.scaleFrames['frame']
+                    v = curve.scaleFrames['scale'] / scale
+                    insertFrames(action, group_name, f'{bone_path}.scale', dict(zip(f, v)), 3)
                 
-                #rot.invert()
-                #rot = Quaternion((rot[0], -rot[1], rot[2], -rot[3]))
-
-                data_path = f'{bone_path}.{"location"}'
-                locations = {f: Vector((location)) - (loc) for f, location in curve.locationFrames.items()}
-
-                insertFrames(action, group_name, data_path, locations, 3)
-
-                data_path = f'{bone_path}.{"rotation_quaternion"}'
-                rotations = {frame : rot.rotation_difference(Quaternion((rotation[3], *rotation[:3]))) for frame, rotation in curve.rotationFrames.items()}
-                #rotations = {frame : Quaternion((-r[3], -r[0], -r[1], -r[2]))  @ rot for frame, r in curve.rotationFrames.items()}
-
-                insertFrames(action, group_name, data_path, rotations, 4)
-
-                data_path = f'{bone_path}.{"scale"}' 
-                scales = {frame: Vector([s / b for s, b in zip(value, scale)]) for frame, value in curve.scaleFrames.items()}
-                insertFrames(action, group_name, data_path, scales, 3)
-                
-                #insertFrames(action, group_name, data_path, curve.scaleFrames, 3)
-
 
         # convert the rotation part of the up_matrix to a quaternion
         up_quat = up_matrix.to_quaternion()

@@ -11,3 +11,6 @@ snp_dumper.py
 *lib/__pycache__
 *.pyc
 /lib/__pycache__
+*.pyc
+profile_data.prof
+*.prof

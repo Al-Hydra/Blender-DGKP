@@ -1,5 +1,5 @@
 from .PyBinaryReader.binary_reader import *
-
+import numpy as np
 
 class DGKP(BrStruct):
     def __init__(self) -> None:
@@ -190,9 +190,24 @@ class MDLD(BrStruct):
 
         br.seek(bonesOffset)
         self.bones = br.read_struct(MDLD_Bone, self.bonesCount)
-
+        
         br.seek(vertexBufferOffset)
-        self.vertices = br.read_struct(MDLD_Vertex, self.vertexCount, self.vertexFlags, self.vertexType)
+        vertex_buffer = br.read_bytes(vertexBufferSize)
+        
+        # Using numpy to handle the vertex data more efficiently
+        vertex_dtype = [('position', '<f4', 3),
+                        ('color', '<u1', 4),
+                        ('normal', '<f2', 4),
+                        ('uv', '<f2', 2)]
+        
+        if self.vertexFlags & 32:  # Check if tangent data is present
+            vertex_dtype.append(('tangent', '<f2', 4))
+        if self.vertexType & 2:  # Check if bone data is present
+            vertex_dtype.append(('boneIDs', '<u2', 4))
+            vertex_dtype.append(('weights', '<f4', 4))
+
+        self.vertices = np.frombuffer(vertex_buffer, dtype=vertex_dtype)
+        
     
     
     def __br_write__(self, br: BinaryReader):
@@ -274,10 +289,11 @@ class MDLD_MaterialMesh(BrStruct):
         pos = br.pos()
 
         br.seek(trianglesOffset)
+        tribuffer = br.read_bytes(trianglesbufferSize)
         if self.type == 2:
-            self.triangles = [br.read_uint16(3) for i in range(self.triangleIndicesCount//3)]
+            self.triangles = np.frombuffer(tribuffer, dtype=np.uint16).reshape(-1, 3)
         elif self.type == 4:
-            self.triangles = [br.read_uint32(3) for i in range(self.triangleIndicesCount//3)]
+            self.triangles = np.frombuffer(tribuffer, dtype=np.uint32).reshape(-1, 3)
 
         br.seek(pos)
     
@@ -302,9 +318,9 @@ class MDLD_Bone(BrStruct):
     
     def __br_read__(self, br: BinaryReader):
         self.name = br.read_str(32)
-        self.rotation = br.read_float(4)
-        self.position = br.read_float(3)
-        self.scale = br.read_float(3)
+        self.rotation = br.read_float32(4)
+        self.position = br.read_float32(3)
+        self.scale = br.read_float32(3)
         self.parent = br.read_int32()
     
     def __br_write__(self, br: BinaryReader):
@@ -326,27 +342,27 @@ class MDLD_Vertex(BrStruct):
         self.weights = [0,0,0,0]  
         
     def __br_read__(self, br: BinaryReader, vertexFlags, vertexType):
-        self.position = br.read_float(3)
+        self.position = br.read_float32(3)
         self.color = br.read_uint8(4)
-        self.normal = br.read_half_float(3)
+        self.normal = br.read_float16(3)
         br.align_pos(4)
-        self.uv = br.read_half_float(2)
+        self.uv = br.read_float16(2)
 
         if vertexFlags & 32:
-            self.tangent = br.read_half_float(3)
+            self.tangent = br.read_float16(3)
             br.align_pos(4)
 
         if vertexType & 2:
             self.boneIDs = br.read_uint16(4)
-            self.weights = br.read_float(4)
+            self.weights = br.read_float32(4)
     
     def __br_write__(self, br: BinaryReader):
         br.write_float(self.position)
         br.write_uint8(self.color)
-        br.write_half_float(self.normal)
+        br.write_float16(self.normal)
         br.write_int16(0)
-        br.write_half_float(self.uv)
-        br.write_half_float(self.tangent)
+        br.write_float16(self.uv)
+        br.write_float16(self.tangent)
         br.write_int16(0)
         br.write_uint16(self.boneIDs)
         br.write_float(self.weights)
@@ -397,21 +413,31 @@ class TOMF_Curve(BrStruct):
         self.index = index
 
         rotationOffset = br.read_uint32()
-        self.rotationCount = br.read_uint32()
+        rotationCount  = br.read_uint32()
         locationOffset = br.read_uint32()
-        self.locationCount = br.read_uint32()
-        scaleOffset = br.read_uint32()
-        self.scaleCount = br.read_uint32()
+        locationCount  = br.read_uint32()
+        scaleOffset    = br.read_uint32()
+        scaleCount     = br.read_uint32()
 
         pos = br.pos()
-        br.seek(rotationOffset)
-        self.rotationFrames = {br.read_int32(): br.read_float(4) for i in range(self.rotationCount)}
 
-        br.seek(locationOffset)
-        self.locationFrames = {br.read_int32(): br.read_float(3) for i in range(self.locationCount)}
+        # --- 1. ROTATION: (int32, float32[4]) ---
+        if rotationCount > 0:
+            br.seek(rotationOffset)
+            rotation_data = br.read_bytes(rotationCount * (4 + 16))
+            self.rotationFrames = np.frombuffer(rotation_data, dtype=[('frame', '<i4'), ('quat', '<f4', 4)])
 
-        br.seek(scaleOffset)
-        self.scaleFrames = {br.read_int32(): br.read_float(3) for i in range(self.scaleCount)}
+        # --- 2. LOCATION: (int32, float32[3]) ---
+        if locationCount > 0:
+            br.seek(locationOffset)
+            location_data = br.read_bytes(locationCount * (4 + 12))
+            self.locationFrames = np.frombuffer(location_data, dtype=[('frame', '<i4'), ('pos', '<f4', 3)])
+
+        # --- 3. SCALE: (int32, float32[3]) ---
+        if scaleCount > 0:
+            br.seek(scaleOffset)
+            scale_data = br.read_bytes(scaleCount * (4 + 12))
+            self.scaleFrames = np.frombuffer(scale_data, dtype=[('frame', '<i4'), ('scale', '<f4', 3)])
 
         br.seek(pos)
 
@@ -432,7 +458,7 @@ class MATF(BrStruct):
             self.materialFormat = br.read_str(64)
             self.vertexShader = br.read_str(64)
             self.pixelShader = br.read_str(64)
-            self.params = br.read_float(14)
+            self.params = br.read_float32(14)
 
         self.texturesCount = br.read_uint32()
 
@@ -449,18 +475,27 @@ class CAMF(BrStruct):
         framesOffset = br.read_uint32()
         self.frameCount = br.read_uint16()
         self.frameRate = br.read_uint16()
-        self.defaultFoV = br.read_float()
+        self.defaultFoV = br.read_float32()
 
         self.frames = {}
 
         pos = br.pos()
         br.seek(framesOffset)
+        
+        # --- 1. FRAMES: (int32, float32[3], float32[3], float32[3], float32) ---
+        '''cam_buffer = br.read_bytes(self.frameCount * (4 + 12 + 12 + 12 + 4))
+        self.frames = np.frombuffer(cam_buffer, dtype=[('frame', '<i4'),
+                                                       ('location', '<f4', 3),
+                                                       ('rotation', '<f4', 3),
+                                                       ('scale', '<f4', 3),
+                                                       ('fov', '<f4')])'''
+        
 
         for i in range(self.frameCount):
-            location = br.read_float(3)
-            rotation = br.read_float(3)
-            scale = br.read_float(3)
-            fov = br.read_float()
+            location = br.read_float32(3)
+            rotation = br.read_float32(3)
+            scale = br.read_float32(3)
+            fov = br.read_float32()
 
             frame = br.read_int32()
 
@@ -504,9 +539,9 @@ class RBLF_Object(BrStruct):
     
     def __br_read__(self, br: BinaryReader):
         self.name = br.read_str(64)
-        self.location = br.read_float(3)
-        self.rotation = br.read_float(4)
-        self.scale = br.read_float(3)
+        self.location = br.read_float32(3)
+        self.rotation = br.read_float32(4)
+        self.scale = br.read_float32(3)
         self.unk = br.read_int32()
         self.flags = br.read_uint32()
     
@@ -530,8 +565,8 @@ class RBLF_ObjectGroup(BrStruct):
         self.objectIndices = []
     
     def __br_read__(self, br: BinaryReader):
-        self.min = br.read_float(4)
-        self.max = br.read_float(4)
+        self.min = br.read_float32(4)
+        self.max = br.read_float32(4)
         self.objectCount = br.read_uint32()
         self.objectIndexOffset = br.read_uint32()
         self.unk2 = br.read_uint32()

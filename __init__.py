@@ -3,7 +3,7 @@ bl_info = {
     "author": "HydraBladeZ",
     "description": "Import Kill la Kill model, texture and animation files into blender",
     "blender": (4, 2, 0),
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "location": "View3D",
     "warning": "",
     "category": "Import"

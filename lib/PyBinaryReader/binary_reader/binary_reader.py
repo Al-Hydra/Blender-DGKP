@@ -7,21 +7,32 @@ import struct
 from contextlib import contextmanager
 from enum import Flag, IntEnum
 from typing import Tuple, Union
+import numpy as np
 
-FMT = dict()
-for c in ["b", "B", "s"]:
-    FMT[c] = 1
-for c in ["h", "H", "e"]:
-    FMT[c] = 2
-for c in ["i", "I", "f"]:
-    FMT[c] = 4
-for c in ["q", "Q"]:
-    FMT[c] = 8
+FMT = {
+    'b': 1, 'B': 1, 's': 1,
+    'h': 2, 'H': 2, 'e': 2,
+    'i': 4, 'I': 4, 'f': 4,
+    'q': 8, 'Q': 8, 'd': 8,
+}
 
+_numpy_dtype_map = {
+    "int8": "i1",
+    "uint8": "u1",
+    "int16": "i2",
+    "uint16": "u2",
+    "int32": "i4",
+    "uint32": "u4",
+    "int64": "i8",
+    "uint64": "u8",
+    "float16": "f2",
+    "float32": "f4",
+    "float64": "f8"
+}
 
-class Endian(Flag):
-    LITTLE = False
-    BIG = True
+class Endian:
+    LITTLE = 0
+    BIG = 1
 
 
 class Whence(IntEnum):
@@ -115,7 +126,7 @@ class BinaryReader:
         if self.__idx == self.size():
             self.__idx += size
 
-        self.extend([0] * size)
+        self.__buf.extend(bytearray(size))
 
     def align_pos(self, size: int) -> int:
         """Aligns the current position to the given size.\n
@@ -210,6 +221,10 @@ class BinaryReader:
     def set_endian(self, endianness: Endian) -> None:
         """Sets the endianness of the BinaryReader."""
         self.__endianness = endianness
+    
+    def get_endian(self) -> Endian:
+        """Returns the endianness of the BinaryReader."""
+        return self.__endianness
 
     def set_encoding(self, encoding: str) -> None:
         """Sets the default encoding of the BinaryReader when reading/writing strings.\n
@@ -221,55 +236,104 @@ class BinaryReader:
     @staticmethod
     def is_iterable(x) -> bool:
         return hasattr(x, '__iter__') and not isinstance(x, (str, bytes))
-
-    def __read_type(self, format: str, count=1):
-        i = self.__idx
-        new_offset = self.__idx + (FMT[format] * count)
-
-        end = ">" if self.__endianness else "<"
-
-        if self.__past_eof(new_offset):
-            raise Exception(
-                'BinaryReader Error: cannot read farther than buffer length.')
-
-        self.__idx = new_offset
-        return struct.unpack_from(end + str(count) + format, self.__buf, i)
+        
     
-    def __peek_type(self, format: str, count=1):
+    def __read_type(self, fmt: str, count=None):
         i = self.__idx
-        end = ">" if self.__endianness else "<"
+        n = 1 if count is None else count
+        size = FMT[fmt] * n
+        if i + size > len(self.__buf):
+            raise ValueError("BinaryReader Error: cannot read beyond buffer length.")
 
-        if self.__past_eof(i + (FMT[format]* count)):
-            raise Exception(
-                'BinaryReader Error: cannot read farther than buffer length.')
+        fmt_str = (">" if self.__endianness else "<") + str(n) + fmt
+        self.__idx += size
+        result = struct.unpack_from(fmt_str, self.__buf, i)
+        return result[0] if count is None else result
 
-        return struct.unpack_from(end + str(count) + format, self.__buf, i)
+    def read_int64(self, count=None): return self.__read_type("q", count)
+    def read_uint64(self, count=None): return self.__read_type("Q", count)
+    def read_int32(self, count=None): return self.__read_type("i", count)
+    def read_uint32(self, count=None): return self.__read_type("I", count)
+    def read_int16(self, count=None): return self.__read_type("h", count)
+    def read_uint16(self, count=None): return self.__read_type("H", count)
+    def read_int8(self, count=None): return self.__read_type("b", count)
+    def read_uint8(self, count=None): return self.__read_type("B", count)
+    def read_float16(self, count=None): return self.__read_type("e", count)
+    def read_float32(self, count=None): return self.__read_type("f", count)
+    def read_float64(self, count=None): return self.__read_type("d", count)
+    
+    def read_type(self, format: str, count=None) -> Union[Tuple, int]:
+        """Reads a value of the given type from the current position.\n
+        If count is given, will return a tuple of values instead of 1 value.
+        """
+        if count is not None:
+            return self.__read_type(format, count)
+        return self.__read_type(format)[0]
 
     def read_bytes(self, size=1) -> bytes:
         """Reads a bytes object with the given size from the current position."""
-        return self.__read_type("s", size)[0]
+        if size < 0:
+            raise ValueError("size cannot be negative")
+
+        end = self.__idx + size
+        if end > len(self.__buf):
+            raise ValueError("BinaryReader Error: can't read beyond buffer length.")
+
+        raw = self.__buf[self.__idx:end]
+        self.__idx = end
+        return raw
 
     def read_str(self, size=None, encoding=None) -> str:
-        """Reads a string with the given size from the current position.\n
-        If size is not given, will read until the first null byte (which the position will be set after).\n
-        If encoding is `None` (default), will use the BinaryReader's encoding.
+        """Reads a UTF-8 or UTF-16 string from the current position.
+        
+        If `size` is None, reads until the first null terminator (1 byte for UTF-8, 2 bytes for UTF-16).
+        If `size` is given, reads exactly that many characters (not bytes).
+        Uses the BinaryReader's encoding if none is provided.
         """
         encode = encoding or self.__encoding
+        buf = self.__buf
+        idx = self.__idx
+
+        is_utf16 = encode.lower().replace('-', '') in {"utf16", "utf16le", "utf16be"}
+        unit_size = 2 if is_utf16 else 1
 
         if size is None:
-            string = bytearray()
-            while self.__idx < len(self.__buf):
-                string.append(self.__buf[self.__idx])
-                self.__idx += 1
-                if string[-1] == 0:
+            chars = bytearray()
+            while idx + unit_size <= len(buf):
+                unit = buf[idx:idx + unit_size]
+                if unit == b'\x00' * unit_size:
+                    idx += unit_size
                     break
-
-            return string.split(b'\x00', 1)[0].decode(encode)
+                chars.extend(unit)
+                idx += unit_size
+            self.__idx = idx
+            return chars.decode(encode)
 
         if size < 0:
             raise ValueError('size cannot be negative')
 
-        return self.read_bytes(size).split(b'\x00', 1)[0].decode(encode)
+        byte_count = size * unit_size
+        end = idx + byte_count
+        raw = buf[idx:end]
+        self.__idx = end
+
+        # Trim null terminator if present
+        null_unit = b'\x00' * unit_size
+        null_pos = raw.find(null_unit)
+        if null_pos != -1:
+            raw = raw[:null_pos]
+
+        return raw.decode(encode)
+
+    
+    def read_str_at_offset(self, offset: int, size=None, encoding=None, whence = Whence.BEGIN) -> str:
+        """Reads a string from a specific offset without changing the current read position."""
+        current = self.__idx
+        try:
+            self.seek(offset, whence)
+            return self.read_str(size, encoding)
+        finally:
+            self.seek(current, Whence.BEGIN)
 
     def read_str_to_token(self, token: str, encoding=None) -> str:
         """Reads a string until a string token is found.\n
@@ -291,85 +355,38 @@ class BinaryReader:
 
         return string.split(b'\x00', 1)[0].decode(encode)
 
-    def read_int64(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads a signed 64-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("q", count)
-        return self.__read_type("q")[0]
+    
+    def read_array(self, type_name: str, count: int) -> np.ndarray:
+        """Reads an array of values as a NumPy array using the specified type name."""
+        if type_name not in _numpy_dtype_map:
+            raise ValueError(f"Unsupported type name '{type_name}' for array reading.")
 
-    def read_uint64(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads an unsigned 64-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("Q", count)
-        return self.__read_type("Q")[0]
+        dtype_str = _numpy_dtype_map[type_name]
+        dtype = np.dtype(dtype_str).newbyteorder('<' if self.__endianness == Endian.LITTLE else '>')
+        size = dtype.itemsize * count
 
-    def read_int32(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads a signed 32-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("i", count)
-        return self.__read_type("i")[0]
+        if self.__idx + size > len(self.__buf):
+            raise ValueError("BinaryReader Error: can't read beyond buffer length.")
 
-    def read_uint32(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads an unsigned 32-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("I", count)
-        return self.__read_type("I")[0]
+        array = np.frombuffer(self.__buf, dtype=dtype, count=count, offset=self.__idx)
+        self.__idx += size
+        return array
 
-    def read_int16(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads a signed 16-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("h", count)
-        return self.__read_type("h")[0]
+    def read_structured_array(self, dtype: Union[str, np.dtype], count: int) -> np.ndarray:
+        """Reads a structured NumPy array based on a given dtype and element count."""
+        if isinstance(dtype, str):
+            dtype = np.dtype(dtype)
 
-    def read_uint16(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads an unsigned 16-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("H", count)
-        return self.__read_type("H")[0]
+        dtype = dtype.newbyteorder('<' if self.__endianness == Endian.LITTLE else '>')
+        size = dtype.itemsize * count
 
-    def read_int8(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads a signed 8-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("b", count)
-        return self.__read_type("b")[0]
+        if self.__idx + size > len(self.__buf):
+            raise ValueError("BinaryReader Error: can't read beyond buffer length.")
 
-    def read_uint8(self, count=None) -> Union[int, Tuple[int]]:
-        """Reads an unsigned 8-bit integer.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("B", count)
-        return self.__read_type("B")[0]
+        array = np.frombuffer(self.__buf, dtype=dtype, count=count, offset=self.__idx)
+        self.__idx += size
+        return array
 
-    def read_float(self, count=None) -> Union[float, Tuple[float]]:
-        """Reads a 32-bit float.\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("f", count)
-        return self.__read_type("f")[0]
-
-    def read_half_float(self, count=None) -> Union[float, Tuple[float]]:
-        """Reads a 16-bit float (half-float).\n
-        If count is given, will return a tuple of values instead of 1 value.
-        """
-        if count is not None:
-            return self.__read_type("e", count)
-        return self.__read_type("e")[0]
 
     def read_struct(self, cls: type, count=None, *args) -> BrStruct:
         """Creates and returns an instance of the given `cls` after calling its `__br_read__` method.\n
@@ -396,70 +413,6 @@ class BinaryReader:
 
         return br_struct
 
-    def peek_bytes(self, count = 1) -> bytes:
-        """Returns the next `count` bytes without advancing the buffer's position."""
-        return self.__buf[self.__idx : self.__idx + count]
-    
-    def peek_int64(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` signed 64-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("q", count)
-        return self.__peek_type("q")[0]
-    
-    def peek_uint64(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` unsigned 64-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("Q", count)
-        return self.__peek_type("Q")[0]
-    
-    def peek_int32(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` signed 32-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("i", count)
-        return self.__peek_type("i")[0]
-    
-    def peek_uint32(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` unsigned 32-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("I", count)
-        return self.__peek_type("I")[0]
-    
-    def peek_int16(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` signed 16-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("h", count)
-        return self.__peek_type("h")[0]
-    
-    def peek_uint16(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` unsigned 16-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("H", count)
-        return self.__peek_type("H")[0]
-    
-    def peek_int8(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` signed 8-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("b", count)
-        return self.__peek_type("b")[0]
-    
-    def peek_uint8(self, count=None) -> Union[int, Tuple[int]]:
-        """Returns the next `count` unsigned 8-bit integers without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("B", count)
-        return self.__peek_type("B")[0]
-    
-    def peek_float(self, count=None) -> Union[float, Tuple[float]]:
-        """Returns the next `count` 32-bit floats without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("f", count)
-        return self.__peek_type("f")[0]
-    
-    def peek_half_float(self, count=None) -> Union[float, Tuple[float]]:
-        """Returns the next `count` 16-bit floats without advancing the buffer's position."""
-        if count is not None:
-            return self.__peek_type("e", count)
-        return self.__peek_type("e")[0]
-
     def __write_type(self, format: str, value, is_iterable: bool) -> None:
         i = self.__idx
 
@@ -478,12 +431,13 @@ class BinaryReader:
             struct.pack_into(end + str(count) + format, self.__buf, i, *value)
         else:
             struct.pack_into(end + str(count) + format, self.__buf, i, value)
-
+    
+            
     def write_bytes(self, value: bytes) -> None:
         """Writes a bytes object to the buffer."""
         self.__write_type("s", value, is_iterable=False)
 
-    def write_str(self, string: str, null=False, encoding=None) -> int:
+    def write_str(self, string: str, null=True, encoding=None) -> int:
         """Writes a whole string to the buffer.\n
         If null is `True`, will append a null byte (`0x00`) after the string.\n
         If encoding is `None` (default), will use the BinaryReader's encoding.\n
@@ -553,17 +507,23 @@ class BinaryReader:
         """
         self.__write_type("B", value, self.is_iterable(value))
 
-    def write_float(self, value: float) -> None:
+    def write_float32(self, value: float) -> None:
         """Writes a 32-bit float.\n
         If value is iterable, will write all of the elements in the given iterable.
         """
         self.__write_type("f", value, self.is_iterable(value))
 
-    def write_half_float(self, value: float) -> None:
+    def write_float16(self, value: float) -> None:
         """Writes a 16-bit float (half-float).\n
         If value is iterable, will write all of the elements in the given iterable.
         """
         self.__write_type("e", value, self.is_iterable(value))
+    
+    def write_float64(self, value: float) -> None:
+        """Writes a 64-bit float.\n
+        If value is iterable, will write all of the elements in the given iterable.
+        """
+        self.__write_type("d", value, self.is_iterable(value))
 
     def write_struct(self, value: BrStruct, *args) -> None:
         """Calls the given value's `__br_write__` method.\n
@@ -580,8 +540,3 @@ class BinaryReader:
                 s.__br_write__(self, *args)
         else:
             value.__br_write__(self, *args)
-    
-    def clear(self) -> None:
-        """Clears the buffer."""
-        self.__buf = bytearray()
-        self.__idx = 0

@@ -3,9 +3,9 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "DGKP_Importer"
-version = "1.1.0"
+version = "1.2.0"
 name = "DGKP Archive Importer/Exporter"
-tagline = "This addon imports DGKP archives (.pac, .txp, .mtex) from Kill la Kill: IF"
+tagline = "This addon imports DGKP archives (.pac, .txp, .mtex, .lev) from Kill la Kill: IF"
 maintainer = "HydraBladeZ"
 # Supported types: "add-on", "theme"
 type = "add-on"

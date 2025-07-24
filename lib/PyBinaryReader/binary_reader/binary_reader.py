@@ -415,22 +415,24 @@ class BinaryReader:
 
     def __write_type(self, format: str, value, is_iterable: bool) -> None:
         i = self.__idx
+        endian = ">" if self.__endianness else "<"
 
-        end = ">" if self.__endianness else "<"
-
-        count = 1
-        if is_iterable or type(value) is bytes:
+        if is_iterable or isinstance(value, (bytes, bytearray)):
             count = len(value)
-
-        if i + (FMT[format] * count) > len(self.__buf):
-            self.pad(FMT[format] * count)
         else:
-            self.__idx += FMT[format] * count
+            count = 1
 
+        size = FMT[format] * count
+        if i + size > len(self.__buf):
+            self.pad(size)
+        else:
+            self.__idx += size
+
+        fmt = f"{endian}{count}{format}"
         if is_iterable:
-            struct.pack_into(end + str(count) + format, self.__buf, i, *value)
+            struct.pack_into(fmt, self.__buf, i, *value)
         else:
-            struct.pack_into(end + str(count) + format, self.__buf, i, value)
+            struct.pack_into(fmt, self.__buf, i, value)
     
             
     def write_bytes(self, value: bytes) -> None:

@@ -7,7 +7,8 @@ from mathutils import Vector, Quaternion, Matrix, Euler
 from bpy_extras.io_utils import ExportHelper
 from math import radians, tan
 from .lib.dgkp import *
-
+import cProfile
+import numpy as np
 class DGKP_IMPORTER_OT_EXPORT(Operator, ExportHelper):
     bl_idname = 'export_scene.dgkp'
     bl_label = 'Export DGKP'
@@ -35,6 +36,10 @@ class DGKP_IMPORTER_OT_EXPORT(Operator, ExportHelper):
         if not dgkp_model:
             self.report({'ERROR'}, "Matching DGKP model not found.")
             return {"CANCELLED"}
+        
+        
+        #profile = cProfile.Profile()
+        #profile.enable()
 
         # Coordinate system matrix
         up_matrix = Matrix.Rotation(radians(90), 4, 'X')
@@ -68,98 +73,157 @@ class DGKP_IMPORTER_OT_EXPORT(Operator, ExportHelper):
         mesh_obj = blender_model.children[0]
         blender_mesh = mesh_obj.data
         blender_mesh.calc_loop_triangles()
-        blender_mesh.calc_tangents()
+        blender_mesh.calc_tangents()        
+        
+        def extract_loop_data_numpy(mesh_obj, bone_name_to_index, up_matrix, max_influences=4):
+            mesh = mesh_obj.data
+            mesh.calc_loop_triangles()
 
-        material_names = [slot.name for slot in mesh_obj.material_slots]
+            num_loops = len(mesh.loops)
+            num_verts = len(mesh.vertices)
+            num_tris = len(mesh.loop_triangles)
 
-        if not blender_mesh.color_attributes:
-            blender_mesh.vertex_colors.new(name='Color', type="BYTE_COLOR", domain="CORNER")
-        color_layer = blender_mesh.color_attributes[0].data
-        uv_layer = blender_mesh.uv_layers[0].data if blender_mesh.uv_layers else None
-        vertex_groups = mesh_obj.vertex_groups
+            # === Allocate NumPy arrays ===
+            vertex_indices = np.empty(num_loops, dtype=np.int32)
+            loop_normals = np.empty((num_loops, 3), dtype=np.float32)
+            positions = np.empty((num_loops, 3), dtype=np.float32)
+            tangents = np.empty((num_loops, 3), dtype=np.float32)
+            uvs = np.zeros((num_loops, 2), dtype=np.float32)
+            colors = np.zeros((num_loops, 4), dtype=np.float32)
 
-        mat_meshes = {mat: [] for mat in material_names}
-        mdl_vertices = []
-        unique_vertex_map = {}
-        next_index = 0
+            mesh.loops.foreach_get("vertex_index", vertex_indices)
+            mesh.loops.foreach_get("normal", loop_normals.ravel())
 
-        bm = bmesh.new()
-        bm.from_mesh(blender_mesh)
-        bm.verts.ensure_lookup_table()
+            if mesh.uv_layers:
+                mesh.uv_layers.active.data.foreach_get("uv", uvs.ravel())
+                uvs[:, 1] = 1 - uvs[:, 1]  # Flip Y
 
-        def make_vertex_key(pos, norm, tang, uv, col, bone_ids, weights, loop_index):
-            return (
-                tuple(pos),
-                tuple(norm),
-                tuple(tang),
-                tuple(uv) if uv else None,
-                tuple(col) if col else None,
-                tuple(bone_ids),
-                tuple(weights),
-                loop_index
-            )
+            if mesh.color_attributes:
+                mesh.color_attributes[0].data.foreach_get("color_srgb", colors.ravel())
+                colors = (colors[:, :4] * 255).astype(np.uint8)
 
-        for tri in blender_mesh.loop_triangles:
-            triverts = []
-            mat_name = material_names[tri.material_index]
+            # === Transform normals ===
+            loop_normals = loop_normals[:, [0, 2, 1]] * [1, 1, -1]
 
-            for loop_index in tri.loops:
-                loop = blender_mesh.loops[loop_index]
-                v_idx = loop.vertex_index
-                v = blender_mesh.vertices[v_idx]
-                bm_vert = bm.verts[v_idx]
+            # === Vertex positions (transformed) ===
+            vert_positions = np.empty((num_verts, 3), dtype=np.float32)
+            mesh.vertices.foreach_get("co", vert_positions.ravel())
+            vert_positions = vert_positions[:, [0, 2, 1]] * [1, 1, -1]
+            positions[:] = vert_positions[vertex_indices]
+            
+            # we need a copy of the mesh without the custom normals for outlines
+            mesh2 = mesh.copy()
+            # reset normals
+            if mesh2.attributes.get("custom_normal"):
+                mesh2.attributes.remove(mesh2.attributes["custom_normal"])
 
-                pos = up_inv @ v.co
-                norm = (up_inv_3x3 @ loop.normal).normalized()
-                tang = (up_inv_3x3 @ bm_vert.normal).normalized()
-                uv = uv_layer[loop_index].uv 
-                uv_final = [uv[0], 1 - uv[1]] 
-                col = [int(c * 255) for c in color_layer[loop_index].color_srgb]
+            # === normals as tangents ===
+            vert_normals = np.empty((num_verts, 3), dtype=np.float32)
+            mesh2.vertices.foreach_get("normal", vert_normals.ravel())
+            # swizzle to match the target format
+            vert_normals = vert_normals[:, [0, 2, 1]] * [1, 1, -1]  # Assuming original normals are in (X, Z, Y) order
+            tangents[:] = vert_normals[vertex_indices]
 
-                groups = sorted(v.groups, key=lambda g: 1 - g.weight)
-                b_weights = [(vertex_groups[g.group].name, g.weight)
-                             for g in groups if vertex_groups[g.group].name in bone_name_to_index]
-                b_weights = (b_weights + [(None, 0.0)] * 4)[:4]
+            # remove mesh2
+            bpy.data.meshes.remove(mesh2)
 
-                total = sum(w for _, w in b_weights)
-                bone_ids = [bone_name_to_index.get(bw[0], 0) for bw in b_weights]
-                weights = [(bw[1] / total if total > 0 else [0, 0, 0, 1][i]) for i, bw in enumerate(b_weights)]
+            # === Fast Bone Weights ===
+            vertex_groups = mesh_obj.vertex_groups
+            bone_ids = np.zeros((num_loops, max_influences), dtype=np.uint16)
+            weights = np.zeros((num_loops, max_influences), dtype=np.float32)
 
-                key = make_vertex_key(pos, norm, tang, uv_final, col, bone_ids, weights, loop_index)
+            # Flatten weight data
+            weight_data = []
+            for v in mesh.vertices:
+                for g in v.groups:
+                    name = vertex_groups[g.group].name
+                    if name in bone_name_to_index:
+                        weight_data.append((v.index, bone_name_to_index[name], g.weight))
 
-                if key in unique_vertex_map:
-                    index = unique_vertex_map[key]
-                else:
-                    index = next_index
-                    unique_vertex_map[key] = index
+            if weight_data:
+                weight_data = np.array(weight_data, dtype=np.float32)
+                vi = weight_data[:, 0].astype(np.int32)
+                bi = weight_data[:, 1].astype(np.int32)
+                w  = weight_data[:, 2]
 
-                    mdl_v = MDLD_Vertex()
-                    mdl_v.position = list(pos)
-                    mdl_v.normal = list(norm)
-                    mdl_v.tangent = list(tang)
-                    mdl_v.uv = uv_final
-                    mdl_v.color = col
-                    mdl_v.boneIDs = bone_ids
-                    mdl_v.weights = weights
+                structured = np.zeros(len(weight_data), dtype=[('v', np.int32), ('b', np.int32), ('w', np.float32)])
+                structured['v'] = vi
+                structured['b'] = bi
+                structured['w'] = w
 
-                    mdl_vertices.append(mdl_v)
-                    next_index += 1
+                sorted_data = np.sort(structured, order=['v', 'w'])[::-1]
 
-                triverts.append(index)
+                v_bone_ids = np.zeros((num_verts, max_influences), dtype=np.uint16)
+                v_weights = np.zeros((num_verts, max_influences), dtype=np.float32)
+                counts = np.zeros((num_verts,), dtype=np.int32)
 
-            mat_meshes[mat_name].append(triverts)
+                for entry in sorted_data:
+                    v = entry['v']
+                    i = counts[v]
+                    if i < max_influences:
+                        v_bone_ids[v, i] = entry['b']
+                        v_weights[v, i] = entry['w']
+                        counts[v] += 1
 
-        dgkp_model.vertices = mdl_vertices
+                # Normalize
+                total = v_weights.sum(axis=1, keepdims=True)
+                v_weights /= total + 1e-8
 
-        for mesh in dgkp_model.materialMeshes:
-            mesh.triangles = mat_meshes.get(mesh.name, [])
+                # Broadcast to loops
+                bone_ids[:] = v_bone_ids[vertex_indices]
+                weights[:] = v_weights[vertex_indices]
+            else:
+                # No weights? fallback to (0, 0, 0, 1)
+                weights[:, 3] = 1.0
 
-        bm.free()
+            # === Triangle index data ===
+            loop_tri_indices = np.empty((num_tris, 3), dtype=np.uint32)
+            material_indices = np.empty(num_tris, dtype=np.uint8)
+            mesh.loop_triangles.foreach_get("loops", loop_tri_indices.ravel())
+            mesh.loop_triangles.foreach_get("material_index", material_indices)
 
+            return {
+                "positions": positions,
+                "normals": loop_normals,
+                "tangents": tangents,
+                "uvs": uvs,
+                "colors": colors,
+                "bone_ids": bone_ids,
+                "weights": weights,
+                "loop_tri_indices": loop_tri_indices,
+                "material_indices": material_indices,
+                "vertex_indices": vertex_indices
+            }
+            
+        loop_data = extract_loop_data_numpy(mesh_obj, bone_name_to_index, up_matrix)
+        
+        # Sort the material indices once
+        sorted_idx = np.argsort(loop_data['material_indices'])
+        sorted_materials = loop_data['material_indices'][sorted_idx]
+        sorted_triangles = loop_data['loop_tri_indices'][sorted_idx]
+
+        # Find boundaries where material changes
+        mat_change = np.where(np.diff(sorted_materials) != 0)[0] + 1
+
+        # Split triangles using those boundaries
+        triangle_groups = np.split(sorted_triangles, mat_change)
+        
+        # remove material indeces, vertex indices and loop tri indices
+        for key in ['material_indices', 'vertex_indices', 'loop_tri_indices']:
+            loop_data.pop(key, None)
+        
+        dgkp_model.vertices = loop_data
+        
+        for i, mesh in enumerate(dgkp_model.materialMeshes):
+            mesh.triangles = triangle_groups[i] if i < len(triangle_groups) else np.array([], dtype=np.uint32)
+        
         write_dgkp(f"{self.filepath}", dgkp)
 
+
+        #profile.disable()
+        #profile.print_stats(sort='time')
         elapsed = time.time() - start_time
-        msg = f"Exported {len(mdl_vertices)} unique vertices in {elapsed:.2f}s"
+        msg = f"Exported {len(loop_data['positions'])} unique vertices in {elapsed:.2f}s"
         print(msg)
         self.report({'INFO'}, msg)
 

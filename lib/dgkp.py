@@ -66,8 +66,8 @@ class DGKP(BrStruct):
     
     def __br_write__(self, br: BinaryReader):
         #header
-        br.write_str("DGKP") #magic
-        br.write_uint64(131072) #version maybe?
+        br.write_str_fixed("DGKP", 4) #magic
+        br.write_bytes(b"\x00\x00\x02\x00\x00\x00\x00\x00")
         br.write_uint32(len(self.allFiles))
         br.write_uint32(48)
         br.write_int8([0]*28) #padding
@@ -78,7 +78,7 @@ class DGKP(BrStruct):
         #files
         for name, file in self.allFiles.items():
             if file.type == "MDLD":
-                br.write_str(file.type)
+                br.write_str_fixed(file.type, 4)
                 br.write_uint32(144) #header size
 
                 file_buf = BinaryReader()
@@ -92,7 +92,7 @@ class DGKP(BrStruct):
                 file_bytes = bytes(file_buf.buffer())
             
             elif file.type == "TEXD":
-                br.write_str(file.type)
+                br.write_str_fixed(file.type, 4)
                 br.write_uint32(144) #header size
                 
                 file_buf = BinaryReader()
@@ -106,7 +106,7 @@ class DGKP(BrStruct):
                 file_bytes = bytes(file_buf.buffer())
 
             else:
-                br.write_str(file.type)
+                br.write_str_fixed(file.type, 4)
                 br.write_uint32(144) #header size
                 br.write_uint32(len(file.data)) #file size
 
@@ -212,7 +212,7 @@ class MDLD(BrStruct):
     
     def __br_write__(self, br: BinaryReader):
         #header
-        br.write_str("LDMF") #magic
+        br.write_str_fixed("LDMF", 4) #magic
         br.write_uint32(160) #version
         br.write_uint32(296) #mat meshes offset
         br.write_uint32(len(self.materialMeshes)) #mat meshes count
@@ -228,8 +228,8 @@ class MDLD(BrStruct):
         if self.vertexFlags & 32:
             vertexSize = 60
 
-        br.write_uint32(len(self.vertices) * vertexSize) #vertex buffer size
-        br.write_uint32(len(self.vertices)) #vertices count
+        br.write_uint32(len(self.vertices["positions"]) * vertexSize) #vertex buffer size
+        br.write_uint32(len(self.vertices["positions"])) #vertices count
         br.write_uint16(self.vertexFlags)
         br.write_uint16(2)
         br.write_str_fixed(self.skeletonName, 64)
@@ -249,8 +249,7 @@ class MDLD(BrStruct):
 
             br.seek(currentPos)
 
-            for triangle in mesh.triangles:
-                br.write_uint32(triangle)
+            br.write_bytes(mesh.triangles.tobytes())
 
 
         currentPos = br.pos()
@@ -268,8 +267,31 @@ class MDLD(BrStruct):
         br.write_uint32(currentPos)
         br.seek(currentPos)
 
-        for vertex in self.vertices:
-            br.write_struct(vertex)
+        '''for vertex in self.vertices:
+            br.write_struct(vertex)'''
+            
+        # Write vertices using numpy structured array
+        dtype = np.dtype([
+        ('position', 'f4', 3),
+        ('color',    'u1', 4),
+        ('normal',   'f2', 4),
+        ('uv',       'f2', 2),
+        ('tangent',  'f2', 4),
+        ('boneIDs',  'u2', 4),
+        ('weights',  'f4', 4)
+        ], align=False)
+
+        vertex_buffer = np.zeros(len(self.vertices["positions"]), dtype=dtype)
+
+        vertex_buffer["position"] = self.vertices["positions"]
+        vertex_buffer["color"] = self.vertices["colors"]
+        vertex_buffer["normal"][:, :3] = self.vertices["normals"]
+        vertex_buffer["tangent"][:, :3] = self.vertices["tangents"]
+        vertex_buffer["uv"] = self.vertices["uvs"]
+        vertex_buffer["boneIDs"] = self.vertices["bone_ids"]
+        vertex_buffer["weights"] = self.vertices["weights"]
+
+        br.write_bytes(vertex_buffer.tobytes())
 
 
 class MDLD_MaterialMesh(BrStruct):
@@ -325,9 +347,9 @@ class MDLD_Bone(BrStruct):
     
     def __br_write__(self, br: BinaryReader):
         br.write_str_fixed(self.name, 32)
-        br.write_float(self.rotation)
-        br.write_float(self.position)
-        br.write_float(self.scale)
+        br.write_float32(self.rotation)
+        br.write_float32(self.position)
+        br.write_float32(self.scale)
         br.write_int32(self.parent)
     
 
@@ -357,7 +379,7 @@ class MDLD_Vertex(BrStruct):
             self.weights = br.read_float32(4)
     
     def __br_write__(self, br: BinaryReader):
-        br.write_float(self.position)
+        br.write_float32(self.position)
         br.write_uint8(self.color)
         br.write_float16(self.normal)
         br.write_int16(0)
@@ -365,7 +387,7 @@ class MDLD_Vertex(BrStruct):
         br.write_float16(self.tangent)
         br.write_int16(0)
         br.write_uint16(self.boneIDs)
-        br.write_float(self.weights)
+        br.write_float32(self.weights)
 
 class ANUM(BrStruct):
     def __init__(self) -> None:
@@ -547,9 +569,9 @@ class RBLF_Object(BrStruct):
     
     def __br_write__(self, br: BinaryReader):
         br.write_str_fixed(self.name, 64)
-        br.write_float(self.location)
-        br.write_float(self.rotation)
-        br.write_float(self.scale)
+        br.write_float32(self.location)
+        br.write_float32(self.rotation)
+        br.write_float32(self.scale)
         br.write_int32(self.unk)
         br.write_uint32(self.flags)
 
@@ -578,8 +600,8 @@ class RBLF_ObjectGroup(BrStruct):
         br.seek(pos)
     
     def __br_write__(self, br: BinaryReader):
-        br.write_float(self.min)
-        br.write_float(self.max)
+        br.write_float32(self.min)
+        br.write_float32(self.max)
         br.write_uint32(self.objectCount)
         self.objectIndexOffsetPos = br.pos()
         br.write_int32(0) #offset will be rewritten later
@@ -599,7 +621,7 @@ def read_dgkp(path):
 
 
 def write_dgkp(path,  dgkp: DGKP):
-    br = BinaryReader(encoding= "cp932")
+    br = BinaryReader(bytearray(), Endian.LITTLE, encoding= "cp932")
     br.write_struct(dgkp)
     with open(path, "wb") as f:
         f.write(br.buffer())
